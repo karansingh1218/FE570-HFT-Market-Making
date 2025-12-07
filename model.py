@@ -1,281 +1,332 @@
 import shift
-import time
-import math
-from datetime import datetime, timedelta
+from time import sleep
+from datetime import timedelta
+from threading import Thread
 
-gamma = 0.01  # risk aversion γ
-sigma = 0.50  # volatility σ
-kappa = 1.5  # market depth κ
+import numpy as np
+from arch import arch_model
+from collections import deque
 
-phi_max = 2  # AS inventory-size response, lots (1 lot = 100 shares)
-eta = -0.005  # AS exponential inventory penalty (paper)
+###############################################################################
+# ------------------------ CONFIG / PARAMETERS -------------------------------
+###############################################################################
 
-SYMBOLS = ["AAPL", "AMZN", "BRKb", "CS1", "CS2", "GOOG", "MSFT"]
+# Tickers to trade (each ticker runs in its own thread)
+SYMBOLS = ["AAPL", "AMZN", "BRKb", "GOOG", "MSFT"]
 
-TRADE_DURATION_MINUTES = 1.0
-TRADE_DURATION_SECONDS = TRADE_DURATION_MINUTES * 60.0
+TRADE_DURATION_MINUTES = 10
 
-UPDATE_INTERVAL = 1.0
-WAIT_TIME = 5.0
+# GARCH window
+PRICE_WINDOW = 120   # number of mid-prices to keep
 
-def safe_get_inventory(trader, sym):
+# Avellaneda–Stoikov parameters
+gamma = 0.01         # risk aversion
+kappa = 1.5          # market depth
+phi_max = 2          # max size (in lots)
+eta = -0.005         # inventory shape
+
+###############################################################################
+# ------------------------ GLOBAL STATE --------------------------------------
+###############################################################################
+
+rolling_mids = {sym: deque(maxlen=PRICE_WINDOW) for sym in SYMBOLS}
+current_sigma = {sym: 0.50 for sym in SYMBOLS}   # fallback sigma until GARCH updates
+last_valid_mid = {sym: None for sym in SYMBOLS}
+
+###############################################################################
+# ------------------------ HELPERS -------------------------------------------
+###############################################################################
+
+def get_safe_mid(best, sym):
+    """
+    Use midprice only, but handle cases where bid/ask are missing.
+    """
+    bid = best.get_bid_price()
+    ask = best.get_ask_price()
+
+    if bid > 0 and ask > 0:
+        mid = (bid + ask) / 2.0
+        last_valid_mid[sym] = mid
+        return mid
+
+    if bid > 0:
+        last_valid_mid[sym] = bid
+        return bid
+
+    if ask > 0:
+        last_valid_mid[sym] = ask
+        return ask
+
+    if last_valid_mid[sym] is not None:
+        return last_valid_mid[sym]
+
+    # absolute fallback
+    print(f"[WARN] No valid mid for {sym}, using 0.01")
+    return 0.01
+
+
+def estimate_sigma_garch(returns):
+    """
+    GARCH(1,1) on log returns, with mild scaling and safe fallback.
+    """
+    returns = np.array(returns, dtype=float)
+    returns = returns[np.isfinite(returns)]
+    returns = returns[np.abs(returns) > 1e-12]
+
+    if len(returns) < 10:
+        return 0.50
+
+    # mild scaling for numerical stability
+    scaled = returns * 100.0
+
     try:
-        return trader.get_portfolio_item(sym).get_shares()
-    except:
-        return 0
+        am = arch_model(
+            scaled,
+            vol="Garch",
+            p=1, q=1,
+            mean="Zero",
+            dist="normal",
+            rescale=False,
+        )
+        res = am.fit(disp="off")
+        forecast = res.forecast(horizon=1)
+        var_t = forecast.variance.iloc[-1, 0]
 
+        sigma_scaled = float(np.sqrt(var_t))
+        sigma_t = sigma_scaled / 100.0  # undo scaling
 
-def safe_get_realized_pl(trader, sym):
-    try:
-        return trader.get_portfolio_item(sym).get_realized_pl()
-    except:
-        return 0.0
+        # clamp to reasonable range
+        sigma_t = max(1e-4, min(sigma_t, 1.0))
+        return sigma_t
 
-
-def get_mid_price(best):
-    return (best.get_bid_price() + best.get_ask_price()) / 2.0
+    except Exception as e:
+        print(f"[GARCH ERROR] {e}")
+        if len(returns) > 1:
+            sigma_t = returns.std()
+            sigma_t = max(1e-4, min(float(sigma_t), 1.0))
+            return sigma_t
+        return 0.50
 
 
 def compute_dynamic_size(q):
     """
-    φ_bid, φ_ask inventory function FROM THE PAPER.
-    q = inventory in shares.
-    φ_max = max lots.
+    Inventory-dependent size from AS-style φ_bid, φ_ask.
+    q is inventory in shares.
     """
     if q < 0:  # short → buy aggressively
         phi_bid = phi_max
-        phi_ask = phi_max * math.exp(-eta * q)
-    else:  # long → sell aggressively
-        phi_bid = phi_max * math.exp(-eta * q)
+        phi_ask = phi_max * np.exp(-eta * q)
+    else:      # long → sell aggressively
+        phi_bid = phi_max * np.exp(-eta * q)
         phi_ask = phi_max
     return max(1, int(phi_bid)), max(1, int(phi_ask))
 
 
-def compute_as_quotes(mid, q, gamma, sigma, kappa, T_minus_t):
+def compute_as_quotes(mid, q, sigma, gamma, kappa, T_minus_t):
     """
-    Avellaneda–Stoikov quoting
+    Pure Avellaneda–Stoikov quoting:
 
     r_t = s_t − q_t γ σ² (T − t)
     δ_a + δ_b = γ σ² (T − t) + 2 ln(1 + γ/κ)
-    δ = (δ_a + δ_b)/2
-    bid = r_t − δ
-    ask = r_t + δ
+    bid = r_t − δ, ask = r_t + δ
     """
-
-    # Indifference price
     r = mid - q * gamma * (sigma ** 2) * T_minus_t
-
-    # Optimal total spread
-    spread = gamma * (sigma ** 2) * T_minus_t + 2 * math.log(1 + gamma / kappa)
-
+    spread = gamma * (sigma ** 2) * T_minus_t + 2.0 * np.log(1.0 + gamma / kappa)
     delta = spread / 2.0
 
-    bid = r - delta
-    ask = r + delta
+    bid = round(r - delta, 2)
+    ask = round(r + delta, 2)
 
-    # Round to tick (0.01)
-    bid = round(bid, 2)
-    ask = round(ask, 2)
-
-    # enforce no-cross
     if bid >= ask:
         bid = ask - 0.01
 
-    # enforce positivity
     bid = max(0.01, bid)
-
     return bid, ask
 
-def main():
-    trader = shift.Trader("ksingh29")
-    trader.connect("initiator.cfg", "o8WS6RAN")
-    print("Connected:", trader.is_connected())
 
-    start_time = time.time()
-    end_time = start_time + TRADE_DURATION_SECONDS
-
-    # Per-symbol state
-    state = {}
-    for sym in SYMBOLS:
-        state[sym] = {
-            "initial_pl": safe_get_realized_pl(trader, sym),
-            "last_time": time.time(),
-            "trades": [],
-            "max_long": 0,
-            "max_short": 0,
-            "max_abs": 0,
-        }
-
-    processed_exec_ids = set()
-    loop_count = 0
-
-    # =================== MAIN LOOP =====================
-    while time.time() < end_time:
-
-        loop_count += 1
-        print(f"\n============= LOOP {loop_count} =============")
-
-        t_elapsed = time.time() - start_time
-        T_minus_t = max(0, TRADE_DURATION_SECONDS - t_elapsed)
-
-        for sym in SYMBOLS:
-
-            print(f"\n--- {sym} ---")
-
-            best = trader.get_best_price(sym)
-            mid = get_mid_price(best)
-            q = safe_get_inventory(trader, sym)
-
-            print(f"Mid: {mid:.4f} | Inventory: {q}")
-
-            # Track inventory extremes
-            state[sym]["max_long"] = max(state[sym]["max_long"], q)
-            state[sym]["max_short"] = min(state[sym]["max_short"], q)
-            state[sym]["max_abs"] = max(state[sym]["max_abs"], abs(q))
-
-            size_bid, size_ask = compute_dynamic_size(q)
-            size_bid = max(1, min(size_bid, 5))
-            size_ask = max(1, min(size_ask, 5))
-
-            # ***** PURE PAPER QUOTES *****
-            bid_px, ask_px = compute_as_quotes(
-                mid=mid,
-                q=q,
-                gamma=gamma,
-                sigma=sigma,
-                kappa=kappa,
-                T_minus_t=T_minus_t
-            )
-
-            print(f"AS Quotes: BID={bid_px:.4f}  ASK={ask_px:.4f} | sizes: {size_bid}/{size_ask}")
-
-            # Algorithm 1 logic
-            waiting_list_sym = [o for o in trader.get_waiting_list() if o.symbol == sym]
-            waiting_size = len(waiting_list_sym)
-
-            print(f"Waiting orders ({sym}): {waiting_size}")
-            last_time = state[sym]["last_time"]
-
-            # 1) No orders resting → place both sides
-            if waiting_size == 0:
-                print("Action: place fresh AS quotes")
-                trader.submit_order(shift.Order(shift.Order.Type.LIMIT_BUY, sym, size_bid, bid_px))
-                trader.submit_order(shift.Order(shift.Order.Type.LIMIT_SELL, sym, size_ask, ask_px))
-
-                state[sym]["last_time"] = time.time()
-
-            # 2) One-sided fill → wait then refresh
-            elif waiting_size == 1:
-                if time.time() - last_time > WAIT_TIME:
-                    print("Action: timeout → cancel & requote")
-                    for o in waiting_list_sym:
-                        trader.submit_cancellation(o)
-
-                    time.sleep(0.2)
-                    trader.submit_order(shift.Order(shift.Order.Type.LIMIT_BUY, sym, size_bid, bid_px))
-                    trader.submit_order(shift.Order(shift.Order.Type.LIMIT_SELL, sym, size_ask, ask_px))
-
-                    state[sym]["last_time"] = time.time()
-
-            # 3) Two resting → periodic refresh
-            else:
-                if time.time() - last_time > UPDATE_INTERVAL:
-                    print("Action: periodic refresh")
-                    for o in waiting_list_sym:
-                        trader.submit_cancellation(o)
-                    time.sleep(0.2)
-
-                    trader.submit_order(shift.Order(shift.Order.Type.LIMIT_BUY, sym, size_bid, bid_px))
-                    trader.submit_order(shift.Order(shift.Order.Type.LIMIT_SELL, sym, size_ask, ask_px))
-
-                    state[sym]["last_time"] = time.time()
-
-        # ---------------- EXECUTION PROCESSING ----------------
-        for order in trader.get_submitted_orders():
-            if order.executed_size > 0 and order.id not in processed_exec_ids:
-
-                execs = trader.get_executed_orders(order.id)
-                for ex in execs:
-                    if ex.executed_size <= 0:
-                        continue
-
-                    sym = ex.symbol
-                    if sym not in state:
-                        continue
-
-                    side = "BUY" if "BUY" in str(ex.type) else "SELL"
-                    shares = ex.executed_size * 100
-                    px = ex.executed_price
-
-                    print(f"EXECUTED {sym}: {shares} @ {px} ({side})")
-
-                    state[sym]["trades"].append(
-                        {"side": side, "qty": shares, "price": px}
-                    )
-
-                processed_exec_ids.add(order.id)
-
-        time.sleep(0.1)
+def cancel_orders(trader, ticker):
+    """
+    Cancel all remaining orders for a specific ticker.
+    """
+    for order in trader.get_waiting_list():
+        if order.symbol == ticker:
+            trader.submit_cancellation(order)
+            sleep(0.25)
 
 
-    print("\n================================================")
-    print("                FINAL PERFORMANCE REPORT         ")
-    print("================================================\n")
+def close_positions(trader, ticker):
+    """
+    Close all long/short positions for the given ticker using market orders.
+    """
+    print(f"[CLOSE POSITIONS] {ticker}")
 
-    total_net_pl = 0.0
+    item = trader.get_portfolio_item(ticker)
 
-    for sym in SYMBOLS:
+    # close any long positions
+    long_shares = item.get_long_shares()
+    if long_shares > 0:
+        print(f"  market selling {ticker}, long shares = {long_shares}")
+        order = shift.Order(
+            shift.Order.Type.MARKET_SELL,
+            ticker,
+            long_shares // 100,  # lots
+        )
+        trader.submit_order(order)
+        sleep(0.5)
 
-        print(f"\n----- {sym} -----")
+    # close any short positions
+    short_shares = item.get_short_shares()
+    if short_shares > 0:
+        print(f"  market buying {ticker}, short shares = {short_shares}")
+        order = shift.Order(
+            shift.Order.Type.MARKET_BUY,
+            ticker,
+            short_shares // 100,
+        )
+        trader.submit_order(order)
+        sleep(0.5)
 
-        final_pl = safe_get_realized_pl(trader, sym)
-        net_pl = final_pl - state[sym]["initial_pl"]
-        total_net_pl += net_pl
+###############################################################################
+# ------------------------ STRATEGY (PER THREAD) -----------------------------
+###############################################################################
 
-        print(f"Initial P&L:          {state[sym]['initial_pl']:.2f}")
-        print(f"Final P&L:            {final_pl:.2f}")
-        print(f"Net P&L:              {net_pl:.2f}")
+def strategy(trader: shift.Trader, ticker: str, endtime):
+    """
+    Threaded strategy function for a single ticker.
+    Runs AS + GARCH until endtime, then closes positions.
+    """
+    print(f"[START STRATEGY] {ticker}")
 
-        print(f"Ending Inventory:     {safe_get_inventory(trader, sym)}")
-        print(f"Max Long Inventory:    {state[sym]['max_long']}")
-        print(f"Max Short Inventory:   {state[sym]['max_short']}")
-        print(f"Max Absolute Inventory:{state[sym]['max_abs']}")
+    check_freq = 1.0  # seconds between loops
+    initial_pl = trader.get_portfolio_item(ticker).get_realized_pl()
 
-        trades = state[sym]["trades"]
-        print(f"Total Executions:     {len(trades)}")
+    # initialize previous mid
+    best_price = trader.get_best_price(ticker)
+    prev_mid = get_safe_mid(best_price, ticker)
 
-        if trades:
-            buys = [t for t in trades if t["side"] == "BUY"]
-            sells = [t for t in trades if t["side"] == "SELL"]
+    while trader.get_last_trade_time() < endtime:
+        # cancel any resting orders for this ticker
+        cancel_orders(trader, ticker)
 
-            def weighted_avg(trs):
-                qty = sum(t["qty"] for t in trs)
-                if qty == 0: return 0
-                return sum(t["qty"] * t["price"] for t in trs) / qty
+        # get updated best prices and mid
+        best_price = trader.get_best_price(ticker)
+        mid = get_safe_mid(best_price, ticker)
 
-            avg_buy = weighted_avg(buys)
-            avg_sell = weighted_avg(sells)
+        # push mid into rolling window
+        rolling_mids[ticker].append(mid)
+        mids = np.array(rolling_mids[ticker], dtype=float)
+        mids = mids[mids > 0]
 
-            profitable = sum(
-                1 for t in sells if t["price"] > avg_buy and avg_buy > 0
-            )
-            winrate = profitable / len(trades)
-
-            print(f"Buys:                 {len(buys)}")
-            print(f"Sells:                {len(sells)}")
-            print(f"Avg Buy Price:        {avg_buy:.4f}")
-            print(f"Avg Sell Price:       {avg_sell:.4f}")
-            print(f"Win Rate:             {winrate * 100:.2f}%")
+        # compute log-returns for GARCH
+        if len(mids) > 1:
+            logp = np.log(mids)
+            rets = np.diff(logp)
         else:
-            print("No executions recorded.")
+            rets = np.array([])
 
-    print("\n================================================")
-    print(f"TOTAL STRATEGY NET P&L: {total_net_pl:.2f}")
-    print("================================================\n")
+        # update sigma once we have enough data
+        if len(mids) >= 20 and len(rets) >= 5:
+            sigma_new = estimate_sigma_garch(rets)
+            current_sigma[ticker] = sigma_new
 
-    trader.disconnect()
-    print("DONE.")
+        sigma = current_sigma[ticker]
+
+        # inventory in shares
+        q = trader.get_portfolio_item(ticker).get_shares()
+
+        # local AS horizon (seconds) – simple constant
+        T_minus_t = 30.0
+
+        # compute AS quotes
+        bid_px, ask_px = compute_as_quotes(mid, q, sigma, gamma, kappa, T_minus_t)
+        size_bid, size_ask = compute_dynamic_size(q)
+
+        # cap max size (lots)
+        size_bid = min(size_bid, 5)
+        size_ask = min(size_ask, 5)
+
+        print(
+            f"[{ticker}] mid={mid:.4f} q={q} σ={sigma:.6f} "
+            f"BID={bid_px}x{size_bid}  ASK={ask_px}x{size_ask}"
+        )
+
+        # place new AS quotes
+        trader.submit_order(shift.Order(shift.Order.Type.LIMIT_BUY, ticker, size_bid, bid_px))
+        trader.submit_order(shift.Order(shift.Order.Type.LIMIT_SELL, ticker, size_ask, ask_px))
+
+        prev_mid = mid
+        sleep(check_freq)
+
+    # after loop: cancel and close
+    cancel_orders(trader, ticker)
+    close_positions(trader, ticker)
+
+    final_pl = trader.get_portfolio_item(ticker).get_realized_pl()
+    print(f"[RESULT] {ticker} P&L = {final_pl - initial_pl:.2f}")
 
 
-if __name__ == "__main__":
-    main()
+
+def main(trader: shift.Trader):
+    """
+    Leaderboard-compatible main function.
+    Sets the session start/end, launches one thread per ticker, and waits.
+    """
+    # reference "current" simulation time from SHIFT
+    current = trader.get_last_trade_time()
+
+    start_time = current
+    end_time = start_time + timedelta(minutes=TRADE_DURATION_MINUTES)
+
+    print(f"[CONFIG] AS-GARCH strategy for {TRADE_DURATION_MINUTES} minutes")
+    print(f"[TIME] start={start_time}  end={end_time}")
+
+    # wait until start_time (for completeness; usually immediate)
+    while trader.get_last_trade_time() < start_time:
+        print("still waiting for market open...")
+        sleep(1)
+
+    threads = []
+    tickers = SYMBOLS
+
+    print("[START SIMULATION]")
+
+    for ticker in tickers:
+        t = Thread(target=strategy, args=(trader, ticker, end_time))
+        threads.append(t)
+
+    # start each thread with a short stagger
+    for t in threads:
+        t.start()
+        sleep(0.25)
+
+    # wait until end_time
+    while trader.get_last_trade_time() < end_time:
+        sleep(1)
+
+    # wait for all strategy threads to finish
+    for t in threads:
+        t.join()
+
+    # final safety: ensure all positions closed
+    for ticker in tickers:
+        cancel_orders(trader, ticker)
+        close_positions(trader, ticker)
+
+    print("[END SIMULATION]")
+    print(f"final bp:  {trader.get_portfolio_summary().get_total_bp()}")
+    print(f"final P&L: {trader.get_portfolio_summary().get_total_realized_pl():.2f}")
+
+
+###############################################################################
+# ------------------------ ENTRYPOINT ----------------------------------------
+###############################################################################
+
+if __name__ == '__main__':
+    with shift.Trader("") as trader:
+        trader.connect("initiator.cfg", "")
+        sleep(1)
+
+        trader.sub_all_order_book()
+        sleep(1)
+
+        main(trader)
