@@ -15,7 +15,7 @@ from collections import deque
 SYMBOLS = ["AAPL", "AMZN", "BRKb", "GOOG", "MSFT"]
 
 # How long you want to trade (in minutes)
-TRADE_DURATION_MINUTES = 1
+TRADE_DURATION_MINUTES = 30
 
 # GARCH window
 PRICE_WINDOW = 120
@@ -404,8 +404,8 @@ def main(trader: shift.Trader):
 ###############################################################################
 
 if __name__ == "__main__":
-    with shift.Trader("ksingh29") as trader:
-        trader.connect("initiator.cfg", "o8WS6RAN")
+    with shift.Trader("") as trader:
+        trader.connect("initiator.cfg", "")
         sleep(1)
 
         trader.sub_all_order_book()
