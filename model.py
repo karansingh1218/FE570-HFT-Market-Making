@@ -1,99 +1,208 @@
-import shift
-from time import sleep
-from datetime import timedelta
-from threading import Thread, Lock
+#!/usr/bin/env python3
+"""
+SHIFT market maker: Avellaneda–Stoikov + (optional) GARCH sigma,
+with a multi-tab Excel report.
+
+FOUNDATIONAL VERSION + MINIMAL FIXES (keeps original Excel output + adds debug cols):
+- Heartbeat prints (so it never looks stuck)
+- stdout flush (macOS fix)
+- Quote TTL + requote thresholds (mid move / sigma change)
+- Non-crossing quote safety
+- Top-of-book guard (avoid crossing market)
+- Per-symbol gamma + min/max spread clamp (microstructure control)
+- Excel workbook: same tabs + timestamped filename, with extra debug columns
+
+Output:
+  shift_run_report_<timestamp>.xlsx
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from arch import arch_model
-from collections import deque
+
+# Optional: GARCH via arch. If not installed or fails, we fall back to rolling std.
+try:
+    from arch import arch_model  # type: ignore
+    ARCH_AVAILABLE = True
+except Exception:
+    ARCH_AVAILABLE = False
+
+import shift  # SHIFT Python client
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+
 
 ###############################################################################
-# ------------------------ CONFIG / PARAMETERS -------------------------------
+# ------------------------------ CONFIG ---------------------------------------
 ###############################################################################
 
-# Symbols to trade (each runs in its own thread)
 SYMBOLS = ["AAPL", "AMZN", "BRKb", "GOOG", "MSFT"]
 
-# How long you want to trade (in minutes)
-TRADE_DURATION_MINUTES = 30
+TRADE_DURATION_MINUTES = 60
 
-# GARCH window
-PRICE_WINDOW = 120
-GARCH_UPDATE_EVERY = 5  # (not strictly needed here, but easy to tweak)
+# Loop / quote management
+LOOP_SLEEP_SEC = 0.35
 
-# Avellaneda–Stoikov parameters
-gamma = 0.01
-kappa = 1.5
-phi_max = 2
-eta = -0.005
+QUOTE_TTL_SEC = 2.0
+REQUOTE_TICK = 0.01
+SIGMA_REQUOTE_PCT = 0.25
 
-###############################################################################
-# ------------------------ GLOBAL STATE --------------------------------------
-###############################################################################
+# Risk limits (shares)
+MAX_ABS_SHARES = 1200
+REDUCE_ONLY_BAND_SHARES = 900
 
-# Per-symbol rolling mids & sigma
-rolling_mids = {sym: deque(maxlen=PRICE_WINDOW) for sym in SYMBOLS}
-current_sigma = {sym: 0.50 for sym in SYMBOLS}
-last_valid_mid = {sym: None for sym in SYMBOLS}
+# Sigma model
+PRICE_WINDOW = 150
+GARCH_UPDATE_EVERY_N = 6
+SIGMA_FALLBACK = 0.005
+SIGMA_MIN = 5e-4      # was 1e-4
+SIGMA_MAX = 1.5e-2     # 1.5% per tick (safety cap)
 
-# Per-symbol stats for final report
-thread_state = {
-    sym: {
-        "initial_pl": 0.0,
-        "trades": [],       # list of {side, qty, price}
-        "max_long": 0,
-        "max_short": 0,
-        "max_abs": 0,
-    }
-    for sym in SYMBOLS
+# AS params (defaults; overridden per-symbol via SYMBOL_PARAMS)
+GAMMA = 0.02
+KAPPA = 1.5
+HORIZON_SEC = 1.0
+
+# Size (lots)
+MIN_LOTS = 1
+MAX_LOTS = 6
+
+# Extra skew (optional)
+EXTRA_SKEW_PER_LOT = 0.00
+
+# Output
+REPORT_DIR = "."
+
+# Per-symbol microstructure clamps (you asked for these back)
+SYMBOL_PARAMS: Dict[str, Dict[str, Any]] = {
+    "AAPL": dict(gamma=0.02, min_spread_c=1, max_spread_c=10),
+    "MSFT": dict(gamma=0.02, min_spread_c=1, max_spread_c=10),
+
+    # tighter to force fills
+    "AMZN": dict(gamma=0.02, min_spread_c=1, max_spread_c=6),
+    "GOOG": dict(gamma=0.02, min_spread_c=1, max_spread_c=6),
+
+    # thinner liquidity
+    "BRKb": dict(gamma=0.06, min_spread_c=2, max_spread_c=12),
 }
 
-state_lock = Lock()  # for thread-safe writes to thread_state
-
-# Track which orders we've already processed for executions
-processed_order_ids = set()
-processed_lock = Lock()
 
 ###############################################################################
-# ------------------------ HELPER FUNCTIONS ----------------------------------
+# ------------------------------ UTIL -----------------------------------------
 ###############################################################################
 
-def get_safe_mid(best, sym):
-    """Midprice with SHIFT-safe fallbacks."""
-    bid = best.get_bid_price()
-    ask = best.get_ask_price()
+def now_utc() -> datetime:
+    return datetime.utcnow()
 
+def ts_str(ts: datetime) -> str:
+    return ts.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def round_tick(px: float, tick: float = 0.01) -> float:
+    return round(round(px / tick) * tick, 2)
+
+def safe_mid_from_best(best: Any, last_mid: Optional[float]) -> Tuple[float, float, float]:
+    """Compute mid with fallbacks. Returns (bid, ask, mid)."""
+    bid = float(getattr(best, "get_bid_price")())
+    ask = float(getattr(best, "get_ask_price")())
     if bid > 0 and ask > 0:
-        mid = (bid + ask) / 2.0
-        last_valid_mid[sym] = mid
-        return mid
-
+        return bid, ask, (bid + ask) / 2.0
     if bid > 0:
-        last_valid_mid[sym] = bid
-        return bid
-
+        return bid, ask, bid
     if ask > 0:
-        last_valid_mid[sym] = ask
-        return ask
-
-    if last_valid_mid[sym] is not None:
-        return last_valid_mid[sym]
-
-    print(f"[WARN] No valid mid for {sym}, using 0.01")
-    return 0.01
+        return bid, ask, ask
+    if last_mid is not None and last_mid > 0:
+        return bid, ask, last_mid
+    return bid, ask, 0.01
 
 
-def estimate_sigma_garch(returns):
-    """GARCH(1,1) on log returns with mild scaling and safe fallback."""
-    returns = np.array(returns, dtype=float)
-    returns = returns[np.isfinite(returns)]
-    returns = returns[np.abs(returns) > 1e-12]
+###############################################################################
+# ------------------------------ SIGMA ----------------------------------------
+###############################################################################
 
-    if len(returns) < 10:
-        return 0.50
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
-    scaled = returns * 100.0
+def estimate_sigma_garch(prices, window=300):
+    try:
+        px = np.asarray(prices, dtype=float)
+        px = px[np.isfinite(px)]
+        px = px[px > 0]
 
+        if px.size < max(30, window + 1):
+            if px.size < 2:
+                return SIGMA_MIN
+            rets = np.diff(np.log(px))
+            rets = rets[np.isfinite(rets)]
+            s = np.nanstd(rets) if rets.size else SIGMA_MIN
+            return clamp(s, SIGMA_MIN, SIGMA_MAX)
+
+        # recent log returns
+        log_px = np.log(px)
+        rets = np.diff(log_px)[-window:]
+        rets = rets[np.isfinite(rets)]
+
+        if rets.size < 30:
+            s = np.nanstd(rets) if rets.size else SIGMA_MIN
+            return clamp(s, SIGMA_MIN, SIGMA_MAX)
+
+        # scale returns for stability
+        scale = 100.0
+        r = rets * scale
+
+        am = arch_model(
+            r,
+            mean="Zero",
+            vol="GARCH",
+            p=1, q=1,
+            dist="normal"
+        )
+        res = am.fit(disp="off")
+
+        opt = getattr(res, "optimization_result", None)
+        if opt is not None and hasattr(opt, "success"):
+            if not opt.success:
+                s = np.nanstd(rets)
+                return clamp(s, SIGMA_MIN, SIGMA_MAX)
+
+        f = res.forecast(horizon=1, reindex=False)
+        var1 = float(f.variance.values[-1, 0])
+
+        if not np.isfinite(var1) or var1 <= 0:
+            s = np.nanstd(rets)
+            return clamp(s, SIGMA_MIN, SIGMA_MAX)
+
+        sigma = np.sqrt(var1) / scale
+        return clamp(float(sigma), SIGMA_MIN, SIGMA_MAX)
+
+    except Exception:
+        return SIGMA_MIN
+
+def estimate_sigma_garch_old(log_returns: np.ndarray) -> float:
+    """GARCH(1,1) on log returns. Falls back to rolling std."""
+    rets = np.asarray(log_returns, dtype=float)
+    rets = rets[np.isfinite(rets)]
+    rets = rets[np.abs(rets) > 1e-12]
+    if len(rets) < 20:
+        s = float(np.std(rets)) if len(rets) > 1 else SIGMA_FALLBACK
+        return clamp(s, SIGMA_MIN, SIGMA_MAX)
+
+    if not ARCH_AVAILABLE:
+        s = float(np.std(rets))
+        return clamp(s, SIGMA_MIN, SIGMA_MAX)
+
+    scaled = rets * 100.0
     try:
         am = arch_model(
             scaled,
@@ -105,310 +214,899 @@ def estimate_sigma_garch(returns):
             rescale=False,
         )
         res = am.fit(disp="off")
-        forecast = res.forecast(horizon=1)
-        var_t = forecast.variance.iloc[-1, 0]
+        f = res.forecast(horizon=1)
+        var_scaled = float(f.variance.iloc[-1, 0])
+        sigma_scaled = math.sqrt(max(var_scaled, 0.0))
+        sigma = sigma_scaled / 100.0
+        return clamp(float(sigma), SIGMA_MIN, SIGMA_MAX)
+    except Exception:
+        s = float(np.std(rets))
+        return clamp(s, SIGMA_MIN, SIGMA_MAX)
 
-        sigma_scaled = float(np.sqrt(var_t))
-        sigma_t = sigma_scaled / 100.0
 
-        sigma_t = max(1e-4, min(sigma_t, 1.0))
-        return sigma_t
+###############################################################################
+# ------------------------------ AS QUOTES ------------------------------------
+###############################################################################
 
+def compute_as_quotes(
+    mid: float,
+    inv_lots: float,
+    sigma: float,
+    gamma: float,
+    kappa: float,
+    horizon_sec: float,
+    min_spread_c: int,
+    max_spread_c: int,
+) -> Tuple[float, float, float, float, float, float, float, float]:
+    """
+    Return:
+      bid, ask, reservation_price, raw_half, clamped_half, min_half, max_half, spread
+    """
+    q = float(inv_lots)
+    T = float(horizon_sec)
+
+    r = mid - q * gamma * (sigma ** 2) * T
+    r -= q * EXTRA_SKEW_PER_LOT
+
+    spread = gamma * (sigma ** 2) * T + 2.0 * math.log(1.0 + gamma / kappa)
+    raw_half = spread / 2.0
+
+    min_half = (min_spread_c / 100.0) / 2.0
+    max_half = (max_spread_c / 100.0) / 2.0
+    half = clamp(raw_half, min_half, max_half)
+
+    bid = round_tick(max(0.01, r - half))
+    ask = round_tick(max(bid + 0.01, r + half))
+
+    return bid, ask, r, raw_half, half, min_half, max_half, spread
+
+
+###############################################################################
+# ------------------------------ SIZING ---------------------------------------
+###############################################################################
+
+def size_from_inventory(inv_shares: int) -> Tuple[int, int]:
+    """Return (bid_lots, ask_lots), inventory-aware and risk-limited."""
+    inv_lots = inv_shares / 100.0
+
+    bid_mult = math.exp(-0.15 * max(inv_lots, 0.0))
+    ask_mult = math.exp(-0.15 * max(-inv_lots, 0.0))
+
+    bid_lots = int(round(MAX_LOTS * bid_mult))
+    ask_lots = int(round(MAX_LOTS * ask_mult))
+
+    bid_lots = int(clamp(bid_lots, MIN_LOTS, MAX_LOTS))
+    ask_lots = int(clamp(ask_lots, MIN_LOTS, MAX_LOTS))
+
+    # Reduce-only band
+    if inv_shares > REDUCE_ONLY_BAND_SHARES:
+        bid_lots = 0
+        ask_lots = MAX_LOTS
+    elif inv_shares < -REDUCE_ONLY_BAND_SHARES:
+        bid_lots = MAX_LOTS
+        ask_lots = 0
+
+    # Hard risk stop
+    if inv_shares >= MAX_ABS_SHARES:
+        bid_lots = 0
+    if inv_shares <= -MAX_ABS_SHARES:
+        ask_lots = 0
+
+    return bid_lots, ask_lots
+
+def lots_to_shares(lots: int) -> int:
+    return int(lots) * 100
+
+def ceil_lots_from_shares(shares: int) -> int:
+    return int(math.ceil(shares / 100.0))
+
+
+###############################################################################
+# ------------------------------ LOGGER ---------------------------------------
+###############################################################################
+
+@dataclass
+class RunLogs:
+    market: List[Dict[str, Any]] = field(default_factory=list)
+    quotes: List[Dict[str, Any]] = field(default_factory=list)
+    orders: List[Dict[str, Any]] = field(default_factory=list)
+    fills: List[Dict[str, Any]] = field(default_factory=list)
+    inventory: List[Dict[str, Any]] = field(default_factory=list)
+    errors: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class SymbolState:
+    sym: str
+    mids: List[float] = field(default_factory=list)
+    sigma: float = SIGMA_FALLBACK
+    ewma: Any = None
+    last_mid: Optional[float] = None
+    last_bid: Optional[float] = None
+    last_ask: Optional[float] = None
+    loops: int = 0
+
+    last_quote_ts: Optional[float] = None
+    last_quote_bid: Optional[float] = None
+    last_quote_ask: Optional[float] = None
+    last_quote_bid_lots: int = 0
+    last_quote_ask_lots: int = 0
+
+    max_long_shares: int = 0
+    max_short_shares: int = 0
+    max_abs_shares: int = 0
+
+    initial_realized_pl: float = 0.0
+    processed_exec_keys: set = field(default_factory=set)
+
+
+###############################################################################
+# ------------------------------ ORDER MGMT -----------------------------------
+###############################################################################
+
+class MarketMaker:
+    def __init__(self):
+        self.total_fills = 0
+
+    def on_execution(self, execution):
+        self.total_fills += execution.get_size()
+
+
+def cancel_resting_symbol_orders(trader: shift.Trader, sym: str, logs: RunLogs) -> int:
+    """Cancel all waiting orders for this symbol only."""
+    count = 0
+    try:
+        for o in list(trader.get_waiting_list()):
+            if getattr(o, "symbol", None) == sym:
+                trader.submit_cancellation(o)
+                logs.orders.append({
+                    "ts": ts_str(now_utc()),
+                    "symbol": sym,
+                    "action": "CANCEL",
+                    "order_id": getattr(o, "id", None),
+                    "type": str(getattr(o, "type", "")),
+                    "lots": getattr(o, "size", None),
+                    "price": getattr(o, "price", None),
+                })
+                count += 1
+                time.sleep(0.03)
     except Exception as e:
-        print(f"[GARCH ERROR] {e}")
-        if len(returns) > 1:
-            sigma_t = returns.std()
-            sigma_t = max(1e-4, min(float(sigma_t), 1.0))
-            return sigma_t
-        return 0.50
+        logs.errors.append({"ts": ts_str(now_utc()), "symbol": sym, "where": "cancel_resting", "error": repr(e)})
+    return count
 
 
-def compute_dynamic_size(q):
-    """
-    AS-style inventory-dependent size.
-    q in shares; we cap size between 1 and 5 lots.
-    """
-    if q < 0:  # short → buy more aggressively
-        phi_bid = phi_max
-        phi_ask = phi_max * np.exp(-eta * q)
-    else:      # long → sell more aggressively
-        phi_bid = phi_max * np.exp(-eta * q)
-        phi_ask = phi_max
+def close_positions_robust(trader: shift.Trader, sym: str, logs: RunLogs, max_tries: int = 12) -> None:
+    """Flatten positions using CEIL(lots) and retry until flat."""
+    for _ in range(max_tries):
+        try:
+            item = trader.get_portfolio_item(sym)
+            long_sh = int(item.get_long_shares())
+            short_sh = int(item.get_short_shares())
 
-    size_bid = min(max(1, int(phi_bid)), 5)
-    size_ask = min(max(1, int(phi_ask)), 5)
-    return size_bid, size_ask
+            if long_sh == 0 and short_sh == 0:
+                return
 
+            if long_sh > 0:
+                lots = ceil_lots_from_shares(long_sh)
+                order = shift.Order(shift.Order.Type.MARKET_SELL, sym, lots)
+                trader.submit_order(order)
+                logs.orders.append({
+                    "ts": ts_str(now_utc()), "symbol": sym, "action": "FLATTEN_SELL",
+                    "order_id": getattr(order, "id", None), "type": "MARKET_SELL",
+                    "lots": lots, "price": None,
+                })
 
-def compute_as_quotes(mid, q, sigma, gamma, kappa, T_minus_t):
-    """
-    Pure Avellaneda–Stoikov quoting.
+            if short_sh > 0:
+                lots = ceil_lots_from_shares(short_sh)
+                order = shift.Order(shift.Order.Type.MARKET_BUY, sym, lots)
+                trader.submit_order(order)
+                logs.orders.append({
+                    "ts": ts_str(now_utc()), "symbol": sym, "action": "FLATTEN_BUY",
+                    "order_id": getattr(order, "id", None), "type": "MARKET_BUY",
+                    "lots": lots, "price": None,
+                })
 
-    r_t     = s_t − q_t γ σ² (T − t)
-    δ_a+δ_b = γ σ² (T − t) + 2 ln(1 + γ/κ)
-    bid     = r_t − δ, ask = r_t + δ
-    """
-    r = mid - q * gamma * (sigma ** 2) * T_minus_t
-    spread = gamma * (sigma ** 2) * T_minus_t + 2.0 * np.log(1.0 + gamma / kappa)
-    delta = spread / 2.0
+            time.sleep(0.6)
+        except Exception as e:
+            logs.errors.append({"ts": ts_str(now_utc()), "symbol": sym, "where": "close_positions", "error": repr(e)})
+            time.sleep(0.6)
 
-    bid = round(r - delta, 2)
-    ask = round(r + delta, 2)
-
-    if bid >= ask:
-        bid = ask - 0.01
-    bid = max(0.01, bid)
-
-    return bid, ask
-
-
-def cancel_orders(trader, ticker):
-    """Cancel all resting orders for this ticker."""
-    for order in trader.get_waiting_list():
-        if order.symbol == ticker:
-            trader.submit_cancellation(order)
-            sleep(0.1)
-
-
-def close_positions(trader, ticker):
-    """Close any long/short inventory for this ticker using market orders."""
-    item = trader.get_portfolio_item(ticker)
-    long_shares = item.get_long_shares()
-    short_shares = item.get_short_shares()
-
-    if long_shares > 0:
-        print(f"[CLOSE] {ticker} selling long {long_shares}")
-        trader.submit_order(
-            shift.Order(shift.Order.Type.MARKET_SELL, ticker, long_shares // 100)
-        )
-
-    if short_shares > 0:
-        print(f"[CLOSE] {ticker} buying back short {short_shares}")
-        trader.submit_order(
-            shift.Order(shift.Order.Type.MARKET_BUY, ticker, short_shares // 100)
-        )
-
-    sleep(0.5)
+    logs.errors.append({"ts": ts_str(now_utc()), "symbol": sym, "where": "close_positions", "error": "Not flat after retries"})
 
 
 ###############################################################################
-# ------------------------ STRATEGY (PER THREAD) -----------------------------
+# ------------------------------ FILL LOGGING ---------------------------------
 ###############################################################################
 
-def strategy(trader: shift.Trader, ticker: str, endtime):
-    """
-    Threaded strategy for a single ticker.
-    Runs AS + GARCH, logs executions, and updates global thread_state.
-    """
-    print(f"[START STRATEGY] {ticker}")
+def process_new_fills(trader: shift.Trader, sym: str, st: SymbolState, logs: RunLogs) -> None:
+    """Scan submitted orders and fetch new executions for this symbol."""
+    try:
+        submitted = list(trader.get_submitted_orders())
+    except Exception as e:
+        logs.errors.append({"ts": ts_str(now_utc()), "symbol": sym, "where": "get_submitted_orders", "error": repr(e)})
+        return
 
-    # baseline P&L
-    with state_lock:
-        thread_state[ticker]["initial_pl"] = trader.get_portfolio_item(
-            ticker
-        ).get_realized_pl()
-
-    while trader.get_last_trade_time() < endtime:
-        # cancel previous quotes
-        cancel_orders(trader, ticker)
-
-        # get mid & inventory
-        best_price = trader.get_best_price(ticker)
-        mid = get_safe_mid(best_price, ticker)
-        inv = trader.get_portfolio_item(ticker).get_shares()
-
-        print(f"[{ticker}] Mid={mid:.4f} Inv={inv}")
-
-        # update inventory extremes
-        with state_lock:
-            thread_state[ticker]["max_long"] = max(
-                thread_state[ticker]["max_long"], inv
-            )
-            thread_state[ticker]["max_short"] = min(
-                thread_state[ticker]["max_short"], inv
-            )
-            thread_state[ticker]["max_abs"] = max(
-                thread_state[ticker]["max_abs"], abs(inv)
-            )
-
-        # update rolling mids
-        rolling_mids[ticker].append(mid)
-        mids_arr = np.array(rolling_mids[ticker], dtype=float)
-        mids_arr = mids_arr[mids_arr > 0]
-
-        rets = np.array([])
-        if len(mids_arr) > 1:
-            logp = np.log(mids_arr)
-            rets = np.diff(logp)
-
-        # GARCH sigma update
-        if len(rets) >= 5:
-            new_sigma = estimate_sigma_garch(rets)
-            current_sigma[ticker] = new_sigma
-            print(f"[{ticker}] σ updated → {new_sigma:.6f}")
-
-        sigma = current_sigma[ticker]
-
-        # compute AS quotes
-        T_minus_t = 30.0  # local horizon in seconds (simple constant)
-        bid_px, ask_px = compute_as_quotes(mid, inv, sigma, gamma, kappa, T_minus_t)
-        size_bid, size_ask = compute_dynamic_size(inv)
-
-        print(
-            f"[{ticker}] Quotes: BID={bid_px}x{size_bid}  "
-            f"ASK={ask_px}x{size_ask}  σ={sigma:.6f}"
-        )
-
-        # submit new quotes
-        trader.submit_order(
-            shift.Order(shift.Order.Type.LIMIT_BUY, ticker, size_bid, bid_px)
-        )
-        trader.submit_order(
-            shift.Order(shift.Order.Type.LIMIT_SELL, ticker, size_ask, ask_px)
-        )
-
-        # process executions for THIS ticker
-        with processed_lock:
-            submitted_orders = list(trader.get_submitted_orders())
-
-        for order in submitted_orders:
-            # only care about this ticker and orders with some execution
-            if order.symbol != ticker or order.executed_size <= 0:
+    for o in submitted:
+        try:
+            if getattr(o, "symbol", None) != sym:
+                continue
+            oid = getattr(o, "id", None)
+            if oid is None:
                 continue
 
-            with processed_lock:
-                if order.id in processed_order_ids:
-                    continue
-                processed_order_ids.add(order.id)
+            executed_size = getattr(o, "executed_size", 0)
+            if not executed_size or executed_size <= 0:
+                continue
 
-            execs = trader.get_executed_orders(order.id)
+            try:
+                execs = list(trader.get_executed_orders(oid))
+            except Exception:
+                execs = []
+
             for ex in execs:
-                if ex.executed_size <= 0 or ex.symbol != ticker:
+                ex_size = getattr(ex, "executed_size", 0)
+                ex_px = getattr(ex, "executed_price", None)
+                ex_type = str(getattr(ex, "type", ""))
+                if not ex_size or ex_size <= 0 or ex_px is None:
                     continue
 
-                side = "BUY" if "BUY" in str(ex.type) else "SELL"
-                qty = ex.executed_size * 100
-                px = ex.executed_price
+                ex_time = getattr(ex, "timestamp", None)
+                ex_time_str = str(ex_time) if ex_time is not None else ts_str(now_utc())
 
-                print(f"[EXEC] {ticker}: {side} {qty} @ {px}")
+                key = (oid, ex_time_str, float(ex_px), int(ex_size), ex_type)
+                if key in st.processed_exec_keys:
+                    continue
+                st.processed_exec_keys.add(key)
 
-                with state_lock:
-                    thread_state[ticker]["trades"].append(
-                        {"side": side, "qty": qty, "price": px}
-                    )
+                side = "BUY" if "BUY" in ex_type else "SELL"
+                lots = int(ex_size)
+                shares = lots_to_shares(lots)
 
-        sleep(0.5)
-
-    # after endtime: clean up
-    cancel_orders(trader, ticker)
-    close_positions(trader, ticker)
-
-    print(f"[END STRATEGY] {ticker}")
+                logs.fills.append({
+                    "ts": ex_time_str,
+                    "symbol": sym,
+                    "side": side,
+                    "lots": lots,
+                    "shares": shares,
+                    "price": float(ex_px),
+                    "order_id": oid,
+                    "order_type": str(getattr(o, "type", "")),
+                    "mid_at_fill": st.last_mid,
+                    "quoted_bid": st.last_quote_bid,
+                    "quoted_ask": st.last_quote_ask,
+                    "sigma": st.sigma,
+                })
+        except Exception as e:
+            logs.errors.append({"ts": ts_str(now_utc()), "symbol": sym, "where": "process_new_fills", "error": repr(e)})
 
 
 ###############################################################################
-# ------------------------ FINAL REPORT --------------------------------------
+# ------------------------------ MTM ESTIMATE ---------------------------------
 ###############################################################################
 
-def final_report(trader: shift.Trader):
-    print("\n================================================")
-    print("              FINAL PERFORMANCE REPORT")
-    print("================================================\n")
+def compute_unrealized_mtm(item: Any, bid: float, ask: float) -> float:
+    """Estimate unrealized P&L from best bid/ask and avg position prices."""
+    try:
+        long_sh = int(item.get_long_shares())
+        short_sh = int(item.get_short_shares())
+        long_px = float(item.get_long_price())
+        short_px = float(item.get_short_price())
+    except Exception:
+        return 0.0
 
-    total_net = 0.0
+    if bid <= 0 and ask > 0:
+        bid = ask
+    if ask <= 0 and bid > 0:
+        ask = bid
+    if bid <= 0 or ask <= 0:
+        return 0.0
 
+    unreal_long = long_sh * (bid - long_px) if long_sh > 0 else 0.0
+    unreal_short = short_sh * (short_px - ask) if short_sh > 0 else 0.0
+    return float(unreal_long + unreal_short)
+
+
+###############################################################################
+# ------------------------------ EXCEL REPORT ---------------------------------
+###############################################################################
+
+HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
+HEADER_FONT = Font(bold=True, color="FFFFFF")
+CENTER = Alignment(horizontal="center", vertical="center")
+
+
+def autosize_columns(ws) -> None:
+    widths: Dict[int, int] = {}
+    for row in ws.iter_rows(values_only=True):
+        for i, v in enumerate(row, start=1):
+            if v is None:
+                continue
+            s = str(v)
+            widths[i] = max(widths.get(i, 8), min(60, len(s) + 2))
+    for i, w in widths.items():
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+
+def write_table(ws, headers: List[str], rows: List[List[Any]], freeze: str = "A2") -> None:
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = CENTER
+    for r in rows:
+        ws.append(r)
+    ws.freeze_panes = freeze
+    ws.auto_filter.ref = "A1:{}{}".format(get_column_letter(len(headers)), max(1, len(rows) + 1))
+    autosize_columns(ws)
+
+
+def build_excel_report(
+    outfile: str,
+    symbols: List[str],
+    start_ts: datetime,
+    end_ts: datetime,
+    params: Dict[str, Any],
+    per_sym: Dict[str, SymbolState],
+    logs: RunLogs,
+) -> None:
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    ws = wb.create_sheet("RunInfo")
+    info_rows = [
+        ["start_utc", ts_str(start_ts)],
+        ["end_utc", ts_str(end_ts)],
+        ["duration_min", (end_ts - start_ts).total_seconds() / 60.0],
+        ["symbols", ", ".join(symbols)],
+    ]
+    for k, v in params.items():
+        info_rows.append([k, v])
+    write_table(ws, ["key", "value"], info_rows, freeze="A2")
+
+    # Market (keep original cols + add debug cols at end)
+    ws = wb.create_sheet("Market")
+    m_headers = [
+        "ts", "symbol",
+        "best_bid", "best_ask", "mid", "mkt_spread",
+        "sigma",
+        "shares", "long_shares", "short_shares",
+        "avg_long_px", "avg_short_px",
+        "realized_pl", "unreal_mtm", "total_pl_est",
+        # debug extras
+        "loop", "ttl_ok", "moved", "sigma_changed", "should_quote",
+    ]
+    m_rows = [[r.get(h) for h in m_headers] for r in logs.market]
+    write_table(ws, m_headers, m_rows)
+
+    # Quotes (keep original cols + add debug cols at end)
+    ws = wb.create_sheet("Quotes")
+    q_headers = [
+        "ts", "symbol",
+        "mid", "sigma", "inv_shares", "inv_lots",
+        "bid_px", "bid_lots", "ask_px", "ask_lots",
+        "quoted_spread", "reason", "canceled_count",
+        "reservation_px", "half_spread",
+        # debug extras
+        "gamma", "kappa", "T", "raw_half", "clamped_half", "min_half", "max_half",
+        "mid_move", "sigma_move", "ttl_ok",
+    ]
+    q_rows = [[r.get(h) for h in q_headers] for r in logs.quotes]
+    write_table(ws, q_headers, q_rows)
+
+    ws = wb.create_sheet("Orders")
+    o_headers = ["ts", "symbol", "action", "order_id", "type", "lots", "price"]
+    o_rows = [[r.get(h) for h in o_headers] for r in logs.orders]
+    write_table(ws, o_headers, o_rows)
+
+    ws = wb.create_sheet("Fills")
+    f_headers = [
+        "ts", "symbol", "side",
+        "lots", "shares", "price",
+        "order_id", "order_type",
+        "mid_at_fill", "slippage_to_mid",
+        "cashflow", "sigma", "quoted_bid", "quoted_ask",
+    ]
+    f_rows = []
+    for r in logs.fills:
+        mid = r.get("mid_at_fill")
+        px = r.get("price")
+        slip = (float(px) - float(mid)) if (mid not in (None, 0) and px is not None) else None
+        side = r.get("side")
+        shares = r.get("shares")
+        cash = None
+        if side and shares and px is not None:
+            cash = (-1 if side == "BUY" else 1) * int(shares) * float(px)
+        f_rows.append([
+            r.get("ts"), r.get("symbol"), side,
+            r.get("lots"), shares, px,
+            r.get("order_id"), r.get("order_type"),
+            mid, slip,
+            cash, r.get("sigma"), r.get("quoted_bid"), r.get("quoted_ask"),
+        ])
+    write_table(ws, f_headers, f_rows)
+
+    ws = wb.create_sheet("Inventory")
+    i_headers = [
+        "ts", "symbol",
+        "shares", "long_shares", "short_shares",
+        "avg_long_px", "avg_short_px",
+        "realized_pl", "unreal_mtm", "total_pl_est",
+        "max_long", "max_short", "max_abs",
+    ]
+    i_rows = [[r.get(h) for h in i_headers] for r in logs.inventory]
+    write_table(ws, i_headers, i_rows)
+
+    ws = wb.create_sheet("Summary")
+    s_headers = [
+        "symbol",
+        "initial_realized_pl",
+        "final_realized_pl",
+        "net_realized_pl",
+        "fills_count",
+        "fill_shares",
+        "buy_shares",
+        "sell_shares",
+        "avg_buy_px",
+        "avg_sell_px",
+        "max_abs_shares",
+    ]
+    rows = []
+    for sym in symbols:
+        st = per_sym[sym]
+        rows.append([sym, st.initial_realized_pl, None, None, None, None, None, None, None, None, st.max_abs_shares])
+    write_table(ws, s_headers, rows)
+
+    for r in range(2, 2 + len(symbols)):
+        sym_cell = "A{}".format(r)
+        ws["E{}".format(r)] = "=COUNTIF(Fills!$B:$B,{})".format(sym_cell)
+        ws["F{}".format(r)] = "=SUMIF(Fills!$B:$B,{},Fills!$E:$E)".format(sym_cell)
+        ws["G{}".format(r)] = "=SUMIFS(Fills!$E:$E,Fills!$B:$B,{},Fills!$C:$C,\"BUY\")".format(sym_cell)
+        ws["H{}".format(r)] = "=SUMIFS(Fills!$E:$E,Fills!$B:$B,{},Fills!$C:$C,\"SELL\")".format(sym_cell)
+        ws["I{}".format(r)] = (
+            "=IFERROR(SUMPRODUCT((Fills!$B:$B={})*(Fills!$C:$C=\"BUY\")*Fills!$E:$E*Fills!$F:$F)"
+            "/SUMIFS(Fills!$E:$E,Fills!$B:$B,{},Fills!$C:$C,\"BUY\"),\"\")"
+        ).format(sym_cell, sym_cell)
+        ws["J{}".format(r)] = (
+            "=IFERROR(SUMPRODUCT((Fills!$B:$B={})*(Fills!$C:$C=\"SELL\")*Fills!$E:$E*Fills!$F:$F)"
+            "/SUMIFS(Fills!$E:$E,Fills!$B:$B,{},Fills!$C:$C,\"SELL\"),\"\")"
+        ).format(sym_cell, sym_cell)
+        ws["D{}".format(r)] = "=C{}-B{}".format(r, r)
+
+    last_realized: Dict[str, float] = {s: per_sym[s].initial_realized_pl for s in symbols}
+    seen = set()
+    for row in reversed(logs.inventory):
+        sym = row.get("symbol")
+        if sym in symbols and sym not in seen:
+            val = row.get("realized_pl")
+            if val is not None:
+                last_realized[sym] = float(val)
+            seen.add(sym)
+            if len(seen) == len(symbols):
+                break
+    for idx, sym in enumerate(symbols, start=2):
+        ws["C{}".format(idx)] = last_realized.get(sym)
+
+    ws = wb.create_sheet("Errors")
+    e_headers = ["ts", "symbol", "where", "error"]
+    e_rows = [[r.get(h) for h in e_headers] for r in logs.errors]
+    write_table(ws, e_headers, e_rows)
+
+    wb.save(outfile)
+
+
+class EWMASigma:
+    def __init__(self, halflife_sec=10.0):
+        self.halflife = float(halflife_sec)
+        self.last_price = None
+        self.last_ts = None
+        self.var = None
+
+    def update(self, price: float, now_ts: float) -> float:
+        if price <= 0 or not np.isfinite(price):
+            return self.current()
+
+        if self.last_price is None:
+            self.last_price = price
+            self.last_ts = now_ts
+            return self.current()
+
+        dt = max(1e-6, now_ts - self.last_ts)
+        lam = math.exp(-math.log(2.0) * dt / self.halflife)
+
+        r = math.log(price / self.last_price)
+        if np.isfinite(r):
+            if self.var is None:
+                self.var = r * r
+            else:
+                self.var = lam * self.var + (1.0 - lam) * (r * r)
+            # print(
+            #     f"[VOL_DBG] r={r:.6e} var={self.var:.6e}",
+            #     flush=True
+            # )
+
+        self.last_price = price
+        self.last_ts = now_ts
+        return self.current()
+
+    def current(self) -> float:
+        if self.var is None:
+            return SIGMA_FALLBACK
+        return clamp(math.sqrt(max(self.var, 0.0)), SIGMA_MIN, SIGMA_MAX)
+
+
+###############################################################################
+# ------------------------------ MAIN STRATEGY --------------------------------
+###############################################################################
+
+def run(trader: shift.Trader) -> str:
+    logs = RunLogs()
+    states: Dict[str, SymbolState] = {s: SymbolState(sym=s) for s in SYMBOLS}
+
+    for s in states.values():
+        s.ewma = EWMASigma(halflife_sec=60.0)
+
+    # record initial realized
     for sym in SYMBOLS:
-        print(f"\n----- {sym} -----")
+        try:
+            item = trader.get_portfolio_item(sym)
+            states[sym].initial_realized_pl = float(item.get_realized_pl())
+        except Exception:
+            states[sym].initial_realized_pl = 0.0
 
-        with state_lock:
-            initial = thread_state[sym]["initial_pl"]
-            trades = list(thread_state[sym]["trades"])
-            max_long = thread_state[sym]["max_long"]
-            max_short = thread_state[sym]["max_short"]
-            max_abs = thread_state[sym]["max_abs"]
+    start_time_utc = now_utc()
 
-        final_pl = trader.get_portfolio_item(sym).get_realized_pl()
-        net = final_pl - initial
-        total_net += net
+    # Market clock handling (prevents "stuck" feeling)
+    try:
+        last_trade_time = trader.get_last_trade_time()
+        end_time = last_trade_time + timedelta(minutes=TRADE_DURATION_MINUTES)
+        print("[RUN] last_trade_time={}".format(last_trade_time), flush=True)
+        print("[RUN] end_time       ={}".format(end_time), flush=True)
+    except Exception as e:
+        logs.errors.append({"ts": ts_str(now_utc()), "symbol": "*", "where": "get_last_trade_time", "error": repr(e)})
+        # fallback wall-clock
+        end_time = now_utc() + timedelta(minutes=TRADE_DURATION_MINUTES)
 
-        print(f"Initial P&L:         {initial:.2f}")
-        print(f"Final P&L:           {final_pl:.2f}")
-        print(f"Net P&L:             {net:.2f}")
-        print(f"Max Long Inventory:  {max_long}")
-        print(f"Max Short Inventory: {max_short}")
-        print(f"Max Abs Inventory:   {max_abs}")
-        print(f"Total Executions:    {len(trades)}")
+    params = dict(
+        TRADE_DURATION_MINUTES=TRADE_DURATION_MINUTES,
+        LOOP_SLEEP_SEC=LOOP_SLEEP_SEC,
+        QUOTE_TTL_SEC=QUOTE_TTL_SEC,
+        REQUOTE_TICK=REQUOTE_TICK,
+        SIGMA_REQUOTE_PCT=SIGMA_REQUOTE_PCT,
+        MAX_ABS_SHARES=MAX_ABS_SHARES,
+        REDUCE_ONLY_BAND_SHARES=REDUCE_ONLY_BAND_SHARES,
+        PRICE_WINDOW=PRICE_WINDOW,
+        GARCH_UPDATE_EVERY_N=GARCH_UPDATE_EVERY_N,
+        SIGMA_FALLBACK=SIGMA_FALLBACK,
+        SIGMA_MIN=SIGMA_MIN,
+        SIGMA_MAX=SIGMA_MAX,
+        ARCH_AVAILABLE=ARCH_AVAILABLE,
+        GAMMA=GAMMA,
+        KAPPA=KAPPA,
+        HORIZON_SEC=HORIZON_SEC,
+        MIN_LOTS=MIN_LOTS,
+        MAX_LOTS=MAX_LOTS,
+        EXTRA_SKEW_PER_LOT=EXTRA_SKEW_PER_LOT,
+    )
 
-        if trades:
-            buys = [t for t in trades if t["side"] == "BUY"]
-            sells = [t for t in trades if t["side"] == "SELL"]
+    try:
+        trader.sub_all_order_book()
+        time.sleep(1.0)
+    except Exception as e:
+        logs.errors.append({"ts": ts_str(now_utc()), "symbol": "*", "where": "sub_all_order_book", "error": repr(e)})
 
-            def wavg(ts):
-                return (
-                    sum(t["qty"] * t["price"] for t in ts) / sum(t["qty"] for t in ts)
-                    if ts
-                    else 0.0
+    last_hb = 0.0
+
+    while True:
+        # heartbeat every ~1s
+        now_wall = time.time()
+        if now_wall - last_hb >= 1.0:
+            print("[HEARTBEAT] {}".format(ts_str(now_utc())), flush=True)
+            last_hb = now_wall
+
+        # end condition: prefer market clock if available
+        try:
+            if trader.get_last_trade_time() >= end_time:
+                break
+        except Exception:
+            if now_utc() >= end_time:
+                break
+
+        loop_start = time.time()
+
+        for sym in SYMBOLS:
+            st = states[sym]
+            st.loops += 1
+
+            # best prices
+            try:
+                best = trader.get_best_price(sym)
+                bid, ask, mid = safe_mid_from_best(best, st.last_mid)
+                st.last_mid, st.last_bid, st.last_ask = mid, bid, ask
+            except Exception as e:
+                logs.errors.append({"ts": ts_str(now_utc()), "symbol": sym, "where": "get_best_price", "error": repr(e)})
+                continue
+
+            # portfolio
+            try:
+                item = trader.get_portfolio_item(sym)
+                shares = int(item.get_shares())
+                long_sh = int(item.get_long_shares())
+                short_sh = int(item.get_short_shares())
+                avg_long = float(item.get_long_price())
+                avg_short = float(item.get_short_price())
+                realized = float(item.get_realized_pl())
+            except Exception as e:
+                logs.errors.append({"ts": ts_str(now_utc()), "symbol": sym, "where": "get_portfolio_item", "error": repr(e)})
+                continue
+
+            inv_lots = shares / 100.0
+
+            st.max_long_shares = max(st.max_long_shares, shares)
+            st.max_short_shares = min(st.max_short_shares, shares)
+            st.max_abs_shares = max(st.max_abs_shares, abs(shares))
+
+            unreal = compute_unrealized_mtm(item, bid, ask)
+            total_est = realized + unreal
+
+            # sigma update
+            st.mids.append(mid)
+            if len(st.mids) > PRICE_WINDOW:
+                st.mids = st.mids[-PRICE_WINDOW:]
+
+            sigma_before = st.sigma
+
+            now_ts = time.time()
+            st.sigma = st.ewma.update(mid, now_ts)
+
+            sigma = st.sigma
+
+            # quote decision
+            now_s = time.time()
+            ttl_ok = st.last_quote_ts is None or (now_s - st.last_quote_ts) >= QUOTE_TTL_SEC
+
+            moved = True
+            if st.last_quote_bid is not None and st.last_quote_ask is not None:
+                last_q_mid = (st.last_quote_bid + st.last_quote_ask) / 2.0
+                moved = abs(mid - last_q_mid) >= REQUOTE_TICK
+
+            sigma_changed = (sigma_before > 0) and (abs(sigma - sigma_before) / sigma_before >= SIGMA_REQUOTE_PCT)
+            should_quote = bool(ttl_ok and (moved or sigma_changed or st.last_quote_ts is None))
+
+            reason = []
+            if ttl_ok: reason.append("TTL")
+            if moved: reason.append("MID_MOVE")
+            if sigma_changed: reason.append("SIGMA_CHG")
+            if st.last_quote_ts is None: reason.append("INIT")
+            reason_str = "+".join(reason) if reason else ""
+
+            # log market snapshot (original + debug)
+            logs.market.append({
+                "ts": ts_str(now_utc()),
+                "symbol": sym,
+                "best_bid": bid,
+                "best_ask": ask,
+                "mid": mid,
+                "mkt_spread": (ask - bid) if (bid > 0 and ask > 0) else None,
+                "sigma": sigma,
+                "shares": shares,
+                "long_shares": long_sh,
+                "short_shares": short_sh,
+                "avg_long_px": avg_long,
+                "avg_short_px": avg_short,
+                "realized_pl": realized,
+                "unreal_mtm": unreal,
+                "total_pl_est": total_est,
+                "loop": st.loops,
+                "ttl_ok": ttl_ok,
+                "moved": moved,
+                "sigma_changed": sigma_changed,
+                "should_quote": should_quote,
+            })
+
+            # process fills (keeps your fill sheet working)
+            process_new_fills(trader, sym, st, logs)
+
+            if should_quote and mid > 0:
+                canceled = cancel_resting_symbol_orders(trader, sym, logs)
+                # ==========================================================
+                # ONE-TIME INVENTORY SEED (REQUIRED FOR LIQUID SYMBOLS)
+                # ==========================================================
+                if shares == 0 and bid > 0 and ask > 0:
+                    try:
+                        o = shift.Order(
+                            shift.Order.Type.MARKET_BUY,
+                            sym,
+                            1  # 1 lot = 100 shares
+                        )
+                        trader.submit_order(o)
+
+                        logs.orders.append({
+                            "ts": ts_str(now_utc()),
+                            "symbol": sym,
+                            "action": "SEED_MARKET_BUY",
+                            "order_id": getattr(o, "id", None),
+                            "type": "MARKET_BUY",
+                            "lots": 1,
+                            "price": None,
+                        })
+
+                        # Give SHIFT time to update inventory before quoting
+                        st.last_quote_ts = time.time()
+                        continue
+
+                    except Exception as e:
+                        logs.errors.append({
+                            "ts": ts_str(now_utc()),
+                            "symbol": sym,
+                            "where": "seed_market_buy",
+                            "error": repr(e),
+                        })
+
+                sp = SYMBOL_PARAMS.get(sym, {"gamma": GAMMA, "min_spread_c": 1, "max_spread_c": 10})
+                gamma = float(sp.get("gamma", GAMMA))
+                min_spread_c = int(sp.get("min_spread_c", 1))
+                max_spread_c = int(sp.get("max_spread_c", 10))
+
+                bid_px, ask_px, r_px, raw_half, half, min_half, max_half, spread = compute_as_quotes(
+                    mid=mid,
+                    inv_lots=inv_lots,
+                    sigma=sigma,
+                    gamma=gamma,
+                    kappa=KAPPA,
+                    horizon_sec=HORIZON_SEC,
+                    min_spread_c=min_spread_c,
+                    max_spread_c=max_spread_c,
                 )
 
-            avg_buy = wavg(buys)
-            avg_sell = wavg(sells)
 
-            print(f"Avg Buy Price:       {avg_buy:.4f}")
-            print(f"Avg Sell Price:      {avg_sell:.4f}")
+                if bid > 0 and ask > 0:
 
-    print("\n================================================")
-    print(f"TOTAL STRATEGY NET P&L: {total_net:.2f}")
-    print("================================================\n")
+                    # Too long → aggressively sell
+                    if shares > REDUCE_ONLY_BAND_SHARES:
+                        bid_px = round_tick(bid - 0.01)
+                        ask_px = round_tick(bid)
+
+                    # Too short → aggressively buy
+                    elif shares < -REDUCE_ONLY_BAND_SHARES:
+                        bid_px = round_tick(ask)
+                        ask_px = round_tick(ask + 0.01)
 
 
-###############################################################################
-# ------------------------ MAIN (SHIFT / LEADERBOARD) ------------------------
-###############################################################################
+                    # if bid > 0 and ask > 0:
+                #
+                #     # Flat → cross on bid to get inventory
+                #     if shares > 0:
+                #         bid_px = round_tick(bid - 0.01)
+                #         ask_px = round_tick(bid)
+                #
+                #     elif shares < 0:
+                #         bid_px = round_tick(ask)
+                #         ask_px = round_tick(ask + 0.01)
 
-def main(trader: shift.Trader):
-    current_time = trader.get_last_trade_time()
-    start_time = current_time
-    end_time = start_time + timedelta(minutes=TRADE_DURATION_MINUTES)
+                    # Short → cross on bid to cover
+                    # else:
+                    #     bid_px = round_tick(ask)
+                    #     ask_px = round_tick(ask + 0.01)
 
-    print(f"[CONFIG] Trading for {TRADE_DURATION_MINUTES} minutes")
-    print(f"[TIME] start={start_time}  end={end_time}")
+                # Final hard safety
+                if bid_px >= ask_px:
+                    ask_px = round_tick(bid_px + 0.01)
 
-    threads = [
-        Thread(target=strategy, args=(trader, sym, end_time))
-        for sym in SYMBOLS
-    ]
+                bid_lots, ask_lots = size_from_inventory(shares)
 
-    # start threads
-    for t in threads:
-        t.start()
-        sleep(0.3)
+                # console debug (Python 3.7 safe)
+                print(
+                    "[{}] best=({:.2f},{:.2f}) quote=({:.2f},{:.2f}) lots=({},{}) inv={} "
+                    "sigma={:.5f} half={:.5f} ttl_ok={} moved={} sig_chg={}".format(
+                        sym, bid, ask, bid_px, ask_px, bid_lots, ask_lots, shares, sigma, half, ttl_ok, moved, sigma_changed
+                    ),
+                    flush=True
+                )
 
-    # wait until end time
-    while trader.get_last_trade_time() < end_time:
-        sleep(1)
+                if bid_lots > 0:
+                    o = shift.Order(shift.Order.Type.LIMIT_BUY, sym, bid_lots, bid_px)
+                    trader.submit_order(o)
+                    logs.orders.append({
+                        "ts": ts_str(now_utc()), "symbol": sym, "action": "SUBMIT",
+                        "order_id": getattr(o, "id", None), "type": "LIMIT_BUY",
+                        "lots": bid_lots, "price": bid_px,
+                    })
 
-    # join all strategy threads
-    for t in threads:
-        t.join()
+                if ask_lots > 0:
+                    o = shift.Order(shift.Order.Type.LIMIT_SELL, sym, ask_lots, ask_px)
+                    trader.submit_order(o)
+                    logs.orders.append({
+                        "ts": ts_str(now_utc()), "symbol": sym, "action": "SUBMIT",
+                        "order_id": getattr(o, "id", None), "type": "LIMIT_SELL",
+                        "lots": ask_lots, "price": ask_px,
+                    })
 
-    # safety: ensure all positions closed
+                st.last_quote_ts = now_s
+                st.last_quote_bid = bid_px
+                st.last_quote_ask = ask_px
+                st.last_quote_bid_lots = bid_lots
+                st.last_quote_ask_lots = ask_lots
+
+                logs.quotes.append({
+                    "ts": ts_str(now_utc()),
+                    "symbol": sym,
+                    "mid": mid,
+                    "sigma": sigma,
+                    "inv_shares": shares,
+                    "inv_lots": inv_lots,
+                    "bid_px": bid_px,
+                    "bid_lots": bid_lots,
+                    "ask_px": ask_px,
+                    "ask_lots": ask_lots,
+                    "quoted_spread": ask_px - bid_px,
+                    "reason": reason_str,
+                    "canceled_count": canceled,
+                    "reservation_px": r_px,
+                    "half_spread": half,
+                    # debug extras
+                    "gamma": gamma,
+                    "kappa": KAPPA,
+                    "T": HORIZON_SEC,
+                    "raw_half": raw_half,
+                    "clamped_half": half,
+                    "min_half": min_half,
+                    "max_half": max_half,
+                    "mid_move": abs(mid - ((st.last_quote_bid + st.last_quote_ask) / 2.0)) if (st.last_quote_bid and st.last_quote_ask) else None,
+                    "sigma_move": (abs(sigma - sigma_before) / sigma_before) if sigma_before else None,
+                    "ttl_ok": ttl_ok,
+                })
+
+            # inventory log (same as before)
+            logs.inventory.append({
+                "ts": ts_str(now_utc()),
+                "symbol": sym,
+                "shares": shares,
+                "long_shares": long_sh,
+                "short_shares": short_sh,
+                "avg_long_px": avg_long,
+                "avg_short_px": avg_short,
+                "realized_pl": realized,
+                "unreal_mtm": unreal,
+                "total_pl_est": total_est,
+                "max_long": st.max_long_shares,
+                "max_short": st.max_short_shares,
+                "max_abs": st.max_abs_shares,
+            })
+
+        elapsed = time.time() - loop_start
+        time.sleep(max(0.0, LOOP_SLEEP_SEC - elapsed))
+
+    # cleanup
     for sym in SYMBOLS:
-        cancel_orders(trader, sym)
-        close_positions(trader, sym)
+        cancel_resting_symbol_orders(trader, sym, logs)
+        close_positions_robust(trader, sym, logs)
 
-    final_report(trader)
+    end_time_utc = now_utc()
+
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    outfile = os.path.join(REPORT_DIR, "shift_run_report_{}.xlsx".format(stamp))
+
+    build_excel_report(outfile, SYMBOLS, start_time_utc, end_time_utc, params, states, logs)
+    return outfile
 
 
-###############################################################################
-# ------------------------ ENTRYPOINT ----------------------------------------
-###############################################################################
+def main() -> None:
+    username = os.getenv("SHIFT_USERNAME", "ksingh29")
+    # DO NOT hardcode passwords. Set SHIFT_PASSWORD in your shell:
+    # export SHIFT_PASSWORD="..."
+    password = os.getenv("SHIFT_PASSWORD", "o8WS6RAN")
+    cfg = os.getenv("SHIFT_CFG", "initiator.cfg")
+
+    print("[SHIFT] user={} cfg={}".format(username, cfg), flush=True)
+
+    with shift.Trader(username) as trader:
+        trader.connect(cfg, password)
+        print("[INFO] Connection established.", flush=True)
+        time.sleep(1.0)
+
+        report = run(trader)
+        print("[DONE] Report written: {}".format(report), flush=True)
+
 
 if __name__ == "__main__":
-    with shift.Trader("") as trader:
-        trader.connect("initiator.cfg", "")
-        sleep(1)
-
-        trader.sub_all_order_book()
-        sleep(1)
-
-        main(trader)
+    main()
